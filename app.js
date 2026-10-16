@@ -706,8 +706,10 @@ void main() {
       this.useVolume(p, vol);
       this.useSheet(p, sh);
       gl.uniform4f(p.u.uRect, (box.x / W) * 2 - 1, 1 - ((box.y + box.h) / H) * 2, (box.w / W) * 2, (box.h / H) * 2);
-      const fill = 0.9 * state.pointScale;
-      gl.uniform2f(p.u.uDot, (box.w / sh.grid[0]) * this.dpr * fill, (box.h / sh.grid[1]) * this.dpr * fill);
+      // Round dots sized by the coarser direction; once cells are too small to read as dots, they overlap into an image.
+      const cell = Math.max(box.w / sh.grid[0], box.h / sh.grid[1]) * this.dpr;
+      const size = cell * (0.9 + 0.5 * clamp((4 - cell) / 2, 0, 1)) * state.pointScale;
+      gl.uniform2f(p.u.uDot, size, size);
       gl.bindVertexArray(this.vao);
       gl.drawArrays(gl.POINTS, 0, sh.grid[0] * sh.grid[1]);
       gl.bindVertexArray(null);
