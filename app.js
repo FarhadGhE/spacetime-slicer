@@ -9,7 +9,7 @@
 (() => {
   const MAX_SECONDS = 60;
   const QUALITY = {  // longest frame side in points, most frames sampled, most points drawn for the 3D block
-    fast: { long: 112, frames: 180, cloud: 900000 },
+    fast: { long: 112, frames: 240, cloud: 900000 },
     balanced: { long: 160, frames: 300, cloud: 1800000 },
     detailed: { long: 224, frames: 450, cloud: 3200000 },
   };
@@ -700,10 +700,12 @@ void main() {
     progress: $('#progress'),
     bar: $('#bar'),
     open: $('#open'),
+    resume: $('#resume'),
     file: $('#file'),
     demo: $('#demo'),
     quality: $('#quality'),
     meta: $('#meta'),
+    viewport: $('.viewport'),
     sliders: [$('#pos-x'), $('#pos-y'), $('#pos-z')],
     values: [$('#val-x'), $('#val-y'), $('#val-z')],
     rows: [...document.querySelectorAll('.slide')],
@@ -879,8 +881,11 @@ void main() {
     finishVolume(vol, ' · open or drop your own video (up to 60 s)');
   }
 
+  // Sampling a video file.
   const MEDIA_ERRORS = { 1: 'aborted', 2: 'network error', 3: 'decode error', 4: 'format not supported' };
-  const WEBKIT = /Apple/.test(navigator.vendor);  // Safari and every browser on iOS
+  // Safari, and every browser on iOS, won't load or seek a video that hasn't started playing, so there the
+  // clip is played through quickly and frames are caught as they are shown. Elsewhere seeking is faster.
+  const WEBKIT = /Apple/.test(navigator.vendor);
 
   function waitFor(video, event, ms, stage) {
     return new Promise((resolve, reject) => {
@@ -892,20 +897,10 @@ void main() {
       };
       const ok = () => finish(resolve);
       const bad = () => finish(reject, Object.assign(new Error('decode'), { code: 'decode' }));
-      const timer = setTimeout(() => finish(reject, new Error(`The video stalled while ${stage}. Try a shorter clip, or an MP4 (H.264).`)), ms);
+      const timer = setTimeout(() => finish(reject, Object.assign(new Error(`The video stalled while ${stage}.`), { code: 'stalled' })), ms);
       video.addEventListener(event, ok);
       video.addEventListener('error', bad);
     });
-  }
-  async function seek(video, t) {
-    // WebKit can fire 'seeked' before the new frame is drawable, so there we also wait for it to be presented.
-    const presented = WEBKIT && video.requestVideoFrameCallback
-      ? new Promise((resolve) => video.requestVideoFrameCallback(resolve))
-      : null;
-    const seeked = waitFor(video, 'seeked', 15000, 'seeking to the next frame');
-    video.currentTime = t;
-    await seeked;
-    if (presented) await Promise.race([presented, new Promise((resolve) => setTimeout(resolve, 300))]);
   }
   // Recorded WebM files often report an unknown length until their end has been read.
   async function measureDuration(video) {
@@ -915,17 +910,18 @@ void main() {
     await Promise.all([changed, seeked]);
     return Number.isFinite(video.duration) ? video.duration : video.currentTime;
   }
-  // Phone browsers decode frames more reliably from a video that is part of the page, so keep it there, invisible.
+  // The clip shows in a small preview while it is sampled; WebKit only decodes frames of a video it can show.
   function createSampler() {
     const video = document.createElement('video');
     video.muted = true;
+    video.defaultMuted = true;
     video.playsInline = true;
     video.preload = 'auto';
     video.setAttribute('muted', '');
     video.setAttribute('playsinline', '');
     video.setAttribute('aria-hidden', 'true');
-    video.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none;';
-    document.body.appendChild(video);
+    video.className = 'sampler';
+    ui.viewport.appendChild(video);
     return video;
   }
   function describeFailure(err, file, video, blockedByPolicy) {
@@ -935,14 +931,114 @@ void main() {
     if (err.code === 'decode') {
       const e = video.error;
       const reason = e ? [MEDIA_ERRORS[e.code], e.message].filter(Boolean).join(': ') : '';
-      return `This browser can't decode ${file.name}${reason ? ` (${reason})` : ''}. Try an MP4 (H.264) or WebM file.`;
+      return `This browser can't decode ${file.name}${reason ? ` (${reason})` : ''}. Try an MP4 (H.264) or MOV file.`;
     }
     return err.message;
+  }
+
+  // Seek to the middle of each frame's time slot. Returns false if the browser stops answering seeks.
+  async function sampleBySeeking(video, vol, span, duration, take, cancelled) {
+    if (video.readyState < 2) await waitFor(video, 'loadeddata', 4000, 'decoding the first frame').catch(() => {});
+    for (let i = 0; i < vol.T; i++) {
+      const seeked = waitFor(video, 'seeked', 6000, 'seeking');
+      video.currentTime = Math.min(((i + 0.5) / vol.T) * span, duration - 0.001);
+      try {
+        await seeked;
+      } catch (err) {
+        if (err.code === 'stalled') return false;
+        throw err;
+      }
+      if (cancelled()) return true;
+      take(i, i);
+    }
+    return true;
+  }
+
+  // Play the clip muted at up to 4× and catch frames as they are shown. Returns how many time slots got a frame.
+  async function sampleByPlaying(video, vol, span, take, cancelled) {
+    if (!video.requestVideoFrameCallback) throw new Error("This browser can't step through a video's frames. Try a recent Safari, Chrome or Firefox.");
+    const T = vol.T, slot = span / T;
+    // as fast as possible while a 60 Hz screen still shows about one frame per time slot
+    const rate = clamp(Math.floor(slot * 60 * 0.8 * 4) / 4, 0.5, 4);
+    try {
+      video.defaultPlaybackRate = rate;
+      video.playbackRate = rate;
+    } catch {
+      video.playbackRate = 1;
+    }
+    if (video.currentTime > 0) video.currentTime = 0;
+    let next = 0;
+    await new Promise((resolve, reject) => {
+      let done = false, watchdog = 0, nudged = false;
+      const play = () => video.play().catch((err) => {
+        if (done) return;
+        if (err.name !== 'NotAllowedError') return finish(err);
+        // Low Power Mode on iPhone, for one, only plays video after a tap.
+        setStatus('Tap Start sampling: this browser only plays the video after a tap.');
+        ui.resume.hidden = false;
+      });
+      const resume = () => {
+        ui.resume.hidden = true;
+        play();
+      };
+      const finish = (err) => {
+        if (done) return;
+        done = true;
+        clearTimeout(watchdog);
+        video.removeEventListener('ended', onEnded);
+        document.removeEventListener('visibilitychange', onVisible);
+        ui.resume.removeEventListener('click', resume);
+        ui.resume.hidden = true;
+        video.pause();
+        if (err) reject(err); else resolve();
+      };
+      const guard = () => {  // give up if frames stop coming while the page is in view
+        clearTimeout(watchdog);
+        watchdog = setTimeout(() => {
+          if (done) return;
+          if (cancelled()) return finish();
+          if (document.hidden || !ui.resume.hidden) return guard();
+          if (!nudged) {
+            nudged = true;
+            play();
+            return guard();
+          }
+          finish(new Error('The video stopped playing while it was being sampled. Try again, or try a shorter clip.'));
+        }, 8000);
+      };
+      const onFrame = (now, meta) => {
+        if (done) return;
+        if (cancelled()) return finish();
+        const i = Math.min(T - 1, Math.floor(meta.mediaTime / slot));
+        if (i >= next) {
+          take(next, i);  // slots skipped by a dropped frame reuse this one
+          next = i + 1;
+        }
+        if (next >= T || meta.mediaTime >= span) return finish();
+        nudged = false;
+        guard();
+        video.requestVideoFrameCallback(onFrame);
+      };
+      const onEnded = () => finish();
+      // Frames can't be caught while the page is out of view, so pause until it is back.
+      const onVisible = () => {
+        if (document.hidden) video.pause();
+        else if (video.paused && ui.resume.hidden) play();
+      };
+      video.addEventListener('ended', onEnded);
+      document.addEventListener('visibilitychange', onVisible);
+      ui.resume.addEventListener('click', resume);
+      video.requestVideoFrameCallback(onFrame);
+      guard();
+      play();
+    });
+    return next;
   }
 
   async function loadFile(file) {
     if (!file) return;
     const token = ++loadToken;
+    const cancelled = () => token !== loadToken;
     setPlaying(false);
     setStatus(`Opening ${file.name}…`);
     setProgress(0);
@@ -958,9 +1054,7 @@ void main() {
       await waitFor(video, 'loadedmetadata', 20000, 'reading the file');
       let duration = video.duration;
       if (!Number.isFinite(duration)) duration = await measureDuration(video);
-      if (token !== loadToken) return;
-      if (video.readyState < 2) await waitFor(video, 'loadeddata', 8000, 'decoding the first frame').catch(() => {});
-      if (token !== loadToken) return;
+      if (cancelled()) return;
       if (!video.videoWidth || !video.videoHeight) throw new Error(`${file.name} has no picture to sample. Pick a video file.`);
       if (!(duration > 0)) throw new Error(`Couldn't tell how long ${file.name} is. Try saving it as an MP4.`);
 
@@ -977,19 +1071,26 @@ void main() {
       const canvas = Object.assign(document.createElement('canvas'), { width: W, height: H });
       const ctx = canvas.getContext('2d', { willReadFrequently: true });
       ctx.imageSmoothingQuality = 'high';
-      for (let i = 0; i < T; i++) {
-        await seek(video, Math.min(((i + 0.5) / T) * span, duration - 0.001));
-        if (token !== loadToken) return;
+      const take = (from, to) => {  // the frame on show fills time slots from..to
         ctx.drawImage(video, 0, 0, W, H);
-        pushFrame(vol, i, ctx.getImageData(0, 0, W, H).data);
-        setProgress((i + 1) / T);
-        setStatus(`Sampling ${file.name} · frame ${i + 1} of ${T}`);
+        const pixels = ctx.getImageData(0, 0, W, H).data;
+        for (let i = from; i <= to; i++) pushFrame(vol, i, pixels);
+        setProgress((to + 1) / T);
+        setStatus(`Sampling ${file.name} · frame ${to + 1} of ${T}`);
+      };
+      const seeked = !WEBKIT && await sampleBySeeking(video, vol, span, duration, take, cancelled);
+      if (cancelled()) return;
+      if (!seeked) {
+        const filled = await sampleByPlaying(video, vol, span, take, cancelled);
+        if (cancelled()) return;
+        if (!filled) throw new Error(`No frames could be caught while ${file.name} played. Keep this page open and in view while it samples, then try again.`);
+        if (filled < T) take(filled, T - 1);  // the clip ended a little early: hold its last frame
       }
       const note = duration > MAX_SECONDS + 0.05 ? ` (the first minute of ${formatSeconds(duration)})` : '';
       finishVolume(vol, note);
     } catch (err) {
       await new Promise((resolve) => setTimeout(resolve, 0));  // a policy violation can be reported just after the error
-      if (token !== loadToken) return;
+      if (cancelled()) return;
       setProgress(null);
       setStatus(describeFailure(err, file, video, blockedByPolicy), true);
     } finally {
