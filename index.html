@@ -23,6 +23,7 @@
   --y: #45dc9c;
   --z: #5bb6ff;
   --warn: #ff9b7a;
+  --sheet: #5bb6ff;  /* the sheet's colour, blended from the axis colours by the way it faces; set by the script */
   --font-display: "Unbounded", "Instrument Sans", system-ui, sans-serif;
   --font-ui: "Instrument Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-data: "Martian Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -100,17 +101,23 @@ canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%
 .sampler { position: absolute; top: 12px; right: 12px; z-index: 1; width: 112px; height: 112px; object-fit: contain; border: 1px solid var(--line); border-radius: 8px; background: var(--ink); pointer-events: none; }
 .axis-label { position: absolute; left: 0; top: 0; color: var(--c); font: 500 11px/1 var(--font-data); white-space: nowrap; text-shadow: 0 0 6px var(--panel), 0 0 2px var(--panel); }
 
-/* sliders under the block */
-.hud { display: grid; gap: 10px; padding: 10px 12px 12px; border-top: 1px solid var(--line); }
-.sliders { display: grid; gap: 2px; }
-.slide {
-  display: grid; grid-template-columns: 30px 100px minmax(0, 1fr) 76px; align-items: center; gap: 12px;
-  padding: 5px 10px; border-radius: 8px; cursor: pointer;
+/* the sheet's controls under the block */
+.hud { --c: var(--sheet); display: grid; gap: 8px; padding: 10px 12px 12px; border-top: 1px solid var(--line); }
+.hud-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+.presets button { padding: 8px 14px; font: 600 13px/1 var(--font-data); letter-spacing: 0.02em; }
+.presets button[aria-pressed="true"] { color: var(--c); background: color-mix(in srgb, var(--c) 16%, var(--raise)); }
+.params { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px 22px; }
+.param { display: grid; grid-template-columns: 78px minmax(0, 1fr) 64px; align-items: center; gap: 10px; padding: 3px 4px; }
+.param.wide { grid-template-columns: 78px minmax(0, 1fr) 150px; }
+.param label { display: flex; align-items: baseline; gap: 8px; color: var(--muted); font-size: 12.5px; white-space: nowrap; cursor: pointer; }
+.param label b { width: 12px; color: var(--text); font: 600 14px/1 var(--font-data); }
+.param output { text-align: right; font: 400 12px/1 var(--font-data); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.num { display: flex; align-items: center; gap: 3px; color: var(--muted); font: 400 12px/1 var(--font-data); }
+.num input {
+  width: 100%; min-width: 0; padding: 6px 7px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--ink); color: var(--text); font: 400 12px/1 var(--font-data); text-align: right; -moz-appearance: textfield;
 }
-.slide.active { background: color-mix(in srgb, var(--c) 10%, transparent); }
-.slide .tag { color: var(--c); font: 600 13px/1 var(--font-data); }
-.slide .through { color: var(--muted); font-size: 12.5px; }
-.slide output { text-align: right; font: 400 12px/1 var(--font-data); font-variant-numeric: tabular-nums; }
+.num input::-webkit-inner-spin-button, .num input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
 .opts { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px 16px; padding-inline: 4px; }
 .size { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12.5px; white-space: nowrap; --c: var(--muted); }
 .size input { width: 120px; }
@@ -133,17 +140,11 @@ input[type="range"]::-moz-range-thumb { width: 11px; height: 11px; border-radius
 .seg button:hover { color: var(--text); }
 .seg button[aria-pressed="true"] { background: var(--raise); color: var(--text); }
 
-/* the cut */
-.tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; padding: 10px; border-bottom: 1px solid var(--line); }
-.tabs button {
-  appearance: none; cursor: pointer; text-align: left;
-  display: grid; gap: 4px; padding: 9px 12px; border-radius: 9px;
-  border: 1px solid var(--line); background: transparent; color: var(--muted);
-}
-.tabs button:hover { border-color: var(--line-strong); }
-.tabs button[aria-selected="true"] { border-color: var(--c); background: color-mix(in srgb, var(--c) 10%, transparent); color: var(--text); }
-.tabs b { color: var(--c); font: 600 15px/1 var(--font-data); }
-.tabs small { font-size: 12px; line-height: 1.2; }
+/* what the sheet touches */
+.cut-head { display: flex; align-items: center; gap: 10px; padding: 13px 16px; border-bottom: 1px solid var(--line); }
+.cut-head h2 { margin: 0; font: 600 13.5px/1.2 var(--font-data); }
+.swatch { flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--sheet); box-shadow: 0 0 0 3px color-mix(in srgb, var(--sheet) 25%, transparent); }
+#slice { cursor: ew-resize; }
 .edge-label { position: absolute; left: 0; top: 0; color: var(--c, var(--muted)); font: 400 11px/1 var(--font-data); white-space: nowrap; pointer-events: none; }
 .transport { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; padding: 10px 12px; border-top: 1px solid var(--line); }
 .play { appearance: none; cursor: pointer; display: grid; place-items: center; width: 40px; height: 40px; border: 0; border-radius: 50%; background: var(--text); color: var(--ink); }
@@ -162,10 +163,11 @@ input[type="range"]::-moz-range-thumb { width: 11px; height: 11px; border-radius
   .hint { display: none; }
   .cut { grid-template-rows: auto auto auto auto; }
   .view { width: 100%; aspect-ratio: 1; max-width: 100%; }
-  .slide { grid-template-columns: 28px minmax(0, 1fr) 70px; gap: 10px; }
-  .slide .through { display: none; }
-  .tabs button { padding: 8px 9px; }
-  .tabs small { font-size: 11px; }
+}
+@media (max-width: 1180px) {
+  .params { grid-template-columns: minmax(0, 1fr); }
+  .param.wide { grid-template-columns: 78px minmax(0, 1fr) 64px; }
+  .param.wide output { white-space: normal; font-size: 11px; line-height: 1.3; }
 }
 </style>
 </head>
@@ -193,7 +195,7 @@ input[type="range"]::-moz-range-thumb { width: 11px; height: 11px; border-radius
   <main class="stage">
     <section class="panel block" aria-label="Point cloud of the video">
       <div class="viewport">
-        <canvas id="cube" aria-label="3D point cloud of the video. Drag to orbit, scroll to zoom, drag a coloured handle to slide its plane."></canvas>
+        <canvas id="cube" aria-label="3D point cloud of the video with the slicing sheet. Drag to orbit, scroll to zoom, drag the sheet's handle to push it through."></canvas>
         <div class="axis-labels" aria-hidden="true">
           <span class="axis-label" style="--c: var(--x)">x · column</span>
           <span class="axis-label" style="--c: var(--y)">y · row</span>
@@ -201,46 +203,62 @@ input[type="range"]::-moz-range-thumb { width: 11px; height: 11px; border-radius
         </div>
         <div class="corner">
           <p class="meta" id="meta"></p>
-          <p class="hint">Drag to orbit · scroll to zoom · drag a coloured handle to slide its plane</p>
+          <p class="hint">Drag to orbit · scroll to zoom · drag the sheet's handle to push it through</p>
         </div>
       </div>
       <div class="hud">
-        <div class="sliders">
-          <label class="slide" data-axis="2" style="--c: var(--z)">
-            <span class="tag">XY</span><span class="through">through time</span>
-            <input type="range" id="pos-z" min="0" max="1" step="1" value="0">
-            <output id="val-z" for="pos-z"></output>
-          </label>
-          <label class="slide" data-axis="1" style="--c: var(--y)">
-            <span class="tag">XZ</span><span class="through">through rows</span>
-            <input type="range" id="pos-y" min="0" max="1" step="1" value="0">
-            <output id="val-y" for="pos-y"></output>
-          </label>
-          <label class="slide" data-axis="0" style="--c: var(--x)">
-            <span class="tag">ZY</span><span class="through">through columns</span>
-            <input type="range" id="pos-x" min="0" max="1" step="1" value="0">
-            <output id="val-x" for="pos-x"></output>
-          </label>
+        <div class="hud-row">
+          <div class="seg presets" role="group" aria-label="Sheet presets">
+            <button type="button" data-preset="xy" aria-pressed="true" style="--c: var(--z)" title="Square to time: a single frame (key 1)">XY</button>
+            <button type="button" data-preset="xz" aria-pressed="false" style="--c: var(--y)" title="Square to rows: one row over time (key 2)">XZ</button>
+            <button type="button" data-preset="zy" aria-pressed="false" style="--c: var(--x)" title="Square to columns: one column over time (key 3)">ZY</button>
+          </div>
+          <div class="seg" role="group" aria-label="Block display">
+            <button type="button" id="mode-ghost" aria-pressed="true" title="Show the whole block as a faint haze around the sheet">Ghost</button>
+            <button type="button" id="mode-cut" aria-pressed="false" title="Hide the part of the block between you and the sheet">Cut</button>
+          </div>
+        </div>
+        <div class="param wide">
+          <label for="depth"><b>d</b>depth</label>
+          <input type="range" id="depth" min="0" max="1" step="0.001" value="0">
+          <output id="depth-out" for="depth"></output>
+        </div>
+        <div class="params">
+          <div class="param">
+            <label for="omega" title="Omega: rotation about the x axis"><b>ω</b>about x</label>
+            <input type="range" id="omega" min="-180" max="180" step="1" value="0">
+            <span class="num"><input type="number" id="omega-num" min="-180" max="180" step="1" value="0" aria-label="Omega, rotation about x, in degrees">°</span>
+          </div>
+          <div class="param">
+            <label for="phi" title="Phi: rotation about the y axis"><b>φ</b>about y</label>
+            <input type="range" id="phi" min="-180" max="180" step="1" value="0">
+            <span class="num"><input type="number" id="phi-num" min="-180" max="180" step="1" value="0" aria-label="Phi, rotation about y, in degrees">°</span>
+          </div>
+          <div class="param">
+            <label for="kappa" title="Kappa: rotation about the z (time) axis"><b>κ</b>about z</label>
+            <input type="range" id="kappa" min="-180" max="180" step="1" value="0">
+            <span class="num"><input type="number" id="kappa-num" min="-180" max="180" step="1" value="0" aria-label="Kappa, rotation about z (time), in degrees">°</span>
+          </div>
+          <div class="param">
+            <label for="sphere" title="0 keeps the sheet flat; 1 bends it all the way into a closed sphere"><b>s</b>sphere</label>
+            <input type="range" id="sphere" min="0" max="1" step="0.01" value="0">
+            <span class="num"><input type="number" id="sphere-num" min="0" max="1" step="0.01" value="0" aria-label="Sphereness, from 0 (flat) to 1 (closed sphere)"></span>
+          </div>
         </div>
         <div class="opts">
-          <div class="seg" role="group" aria-label="Block display">
-            <button type="button" id="mode-cut" aria-pressed="true" title="Hide the part of the block between you and the plane">Cut</button>
-            <button type="button" id="mode-ghost" aria-pressed="false" title="Show the whole block faintly, with all three planes">Ghost</button>
-          </div>
           <label class="size" for="size">Point size <input type="range" id="size" min="0.35" max="1.8" step="0.05" value="1"></label>
           <button type="button" class="btn quiet" id="reset">Reset view</button>
         </div>
       </div>
     </section>
 
-    <section class="panel cut" aria-label="Points on the active plane">
-      <div class="tabs" role="tablist" aria-label="Plane">
-        <button type="button" role="tab" data-axis="2" style="--c: var(--z)" aria-selected="true"><b>XY</b><small>frame</small></button>
-        <button type="button" role="tab" data-axis="1" style="--c: var(--y)" aria-selected="false"><b>XZ</b><small>row over time</small></button>
-        <button type="button" role="tab" data-axis="0" style="--c: var(--x)" aria-selected="false"><b>ZY</b><small>column over time</small></button>
+    <section class="panel cut" aria-label="What the sheet touches">
+      <div class="cut-head">
+        <span class="swatch" aria-hidden="true"></span>
+        <h2 id="sheet-name">XY · a frame</h2>
       </div>
       <div class="view">
-        <canvas id="slice" aria-label="Points on the active plane. Click or drag to move the crosshair, scroll to slide the plane."></canvas>
+        <canvas id="slice" aria-label="The points the sheet touches, laid out flat. Drag sideways or scroll to push the sheet through the block."></canvas>
         <span class="edge-label" id="label-u"></span>
         <span class="edge-label" id="label-v"></span>
       </div>

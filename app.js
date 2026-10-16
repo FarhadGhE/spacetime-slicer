@@ -2,9 +2,9 @@
 /*
   Spacetime Slicer
   A video becomes a block of points: x = column, y = row, z = time (one layer per sampled frame).
-  Left: the block in 3D with three planes you can slide. Right: the points on the active plane.
-  XY is a single frame (sliding it through z plays the video), XZ is one row of pixels over time,
-  ZY is one column of pixels over time (a slit-scan).
+  A sheet cuts through the block. ω, φ and κ tilt it about the x, y and z axes, depth pushes it
+  through the block along its normal, and sphereness bends it into part of a sphere.
+  Left: the block in 3D with the sheet. Right: the points the sheet touches, laid out flat.
 */
 (() => {
   const MAX_SECONDS = 60;
@@ -13,15 +13,29 @@
     balanced: { long: 160, frames: 300, cloud: 1800000 },
     detailed: { long: 224, frames: 450, cloud: 3200000 },
   };
-  const UV_AXES = [[2, 1], [0, 2], [0, 1]];  // plane k in the slice view: [horizontal axis, vertical axis]
   const AXIS_NAMES = ['x · column', 'y · row', 'z · time'];
   const AXIS_TOKENS = ['--x', '--y', '--z'];
-  const EXPLAIN = [
-    'One column of pixels unrolled across time, like a photo-finish camera. Whatever passes the column gets painted in.',
-    'One row of pixels stacked through time. Anything moving across the row smears into streaks and curves.',
-    'A single frame of the video. Slide this plane through z (time) and the video plays.',
-  ];
-  const RAIL_GAP = 0.14;                     // how far the handle rails sit outside the block
+  // The classic slices: the sheet square to time, to rows, or to columns.
+  const PRESETS = {
+    xy: { omega: 0, phi: 0, kappa: 0 },
+    xz: { omega: -90, phi: 0, kappa: 0 },
+    zy: { omega: 0, phi: 90, kappa: 0 },
+  };
+  const SHEET_NAMES = {
+    xy: 'XY · a frame',
+    xz: 'XZ · one row over time',
+    zy: 'ZY · one column over time',
+    tilted: 'Tilted sheet',
+    curved: 'Curved sheet',
+  };
+  const EXPLAIN = {
+    xy: 'A single frame of the video. Push the sheet through time and the video plays.',
+    xz: 'One row of pixels stacked through time. Anything moving across the row smears into streaks and curves.',
+    zy: 'One column of pixels unrolled across time, like a photo-finish camera. Whatever passes the column gets painted in.',
+    tilted: 'A tilted sheet cuts through space and time at once, so each part of it shows a different moment.',
+    curved: 'The sheet is bent into part of a sphere. This is its surface unrolled flat, with its centre in the middle.',
+  };
+  const GHOST_ALPHA = 0.1;
   const BOX_EDGES = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
   const ICON_PLAY = '<svg width="14" height="16" viewBox="0 0 14 16" aria-hidden="true"><path d="M2 1.6v12.8a.9.9 0 0 0 1.36.77l10.2-6.4a.9.9 0 0 0 0-1.54L3.36.83A.9.9 0 0 0 2 1.6z" fill="currentColor"/></svg>';
   const ICON_PAUSE = '<svg width="14" height="16" viewBox="0 0 14 16" aria-hidden="true"><rect x="1.5" y="1" width="4" height="14" rx="1.2" fill="currentColor"/><rect x="8.5" y="1" width="4" height="14" rx="1.2" fill="currentColor"/></svg>';
@@ -41,15 +55,19 @@
   const WHITE = [1, 1, 1];
 
   const state = {
-    vol: null,       // { W, H, T, dims, half, grid, cloudSpacing, duration, loaded, name }
-    pos: [0, 0, 0],  // slice index along x (column), y (row), z (frame)
-    active: 2,       // plane shown in the slice view: 2 = XY, 1 = XZ, 0 = ZY
-    mode: 'cut',
+    vol: null,     // { W, H, T, dims, half, grid, ghostGrid, cloudSpacing, ghostSpacing, duration, loaded, name }
+    depth: 0,      // 0 to 1: how far the sheet has been pushed through the block
+    omega: 0,      // degrees of rotation about x
+    phi: 0,        // about y
+    kappa: 0,      // about z (time)
+    sphere: 0,     // 0 keeps the sheet flat, 1 closes it into a sphere
+    mode: 'ghost',
     pointScale: 1,
     playing: false,
     speed: 1,
-    source: null,    // what to sample again when the detail setting changes
+    source: null,  // what to sample again when the detail setting changes
   };
+  let sheet = null;  // the sheet's geometry, derived from the state by computeSheet()
 
   // ---------- matrices (column-major, like WebGL) ----------
   function perspective(fovy, aspect, near, far) {
@@ -86,41 +104,90 @@
     return [(x / q * 0.5 + 0.5) * w, (0.5 - y / q * 0.5) * h];
   }
 
-  // ---------- block geometry ----------
-  // World coordinate of slice index i along axis k: x runs left to right, row 0 is the top, frame 0 is the front face.
+  // ---------- block and sheet geometry ----------
+  // World coordinate of index i along axis k: x runs left to right, row 0 is the top, frame 0 is the front face.
   function worldCoord(vol, k, i) {
     const h = vol.half[k], n = i / Math.max(vol.dims[k] - 1, 1);
     return k === 0 ? -h + 2 * h * n : h - 2 * h * n;
   }
+  function indexAt(vol, k, w) {
+    const h = vol.half[k];
+    return ((k === 0 ? w + h : h - w) / (2 * h)) * (vol.dims[k] - 1);
+  }
   function spacing(vol, k) {
     return (2 * vol.half[k]) / Math.max(vol.dims[k] - 1, 1);
-  }
-  function planeCorners(half, k, w) {
-    const [a, b, c] = half;
-    if (k === 0) return [[w, -b, -c], [w, b, -c], [w, b, c], [w, -b, c]];
-    if (k === 1) return [[-a, w, -c], [a, w, -c], [a, w, c], [-a, w, c]];
-    return [[-a, -b, w], [a, -b, w], [a, b, w], [-a, b, w]];
-  }
-  // Each plane's handle rides a rail just outside the block, near the front-bottom-right corner.
-  function railPoint(half, k, w) {
-    const [a, b, c] = half, m = RAIL_GAP;
-    if (k === 0) return [w, -b - m, c + m];
-    if (k === 1) return [a + m, w, c + m];
-    return [a + m, -b - m, w];
-  }
-  function planeAnchor(half, k, w) {
-    const [a, b, c] = half;
-    if (k === 0) return [w, -b, c];
-    if (k === 1) return [a, w, c];
-    return [a, -b, w];
   }
   function makeVolume(W, H, T, duration, name, cloudBudget) {
     const long = Math.max(W, H);
     const half = [W / long, H / long, 1];  // time is as deep as the frame is wide (or tall)
     const f = Math.min(1, Math.cbrt(cloudBudget / (W * H * T)));
     const grid = [W, H, T].map((d) => Math.max(2, Math.round(d * f)));
-    const cloudSpacing = Math.max((2 * half[0]) / (grid[0] - 1), (2 * half[1]) / (grid[1] - 1));
-    return { W, H, T, dims: [W, H, T], half, grid, cloudSpacing, duration, loaded: 0, name };
+    const ghostGrid = grid.map((g) => Math.max(2, Math.round(g / 2)));  // a faint haze needs far fewer points
+    const pitch = (g) => Math.max((2 * half[0]) / (g[0] - 1), (2 * half[1]) / (g[1] - 1));
+    return {
+      W, H, T, dims: [W, H, T], half, grid, ghostGrid,
+      cloudSpacing: pitch(grid), ghostSpacing: pitch(ghostGrid), duration, loaded: 0, name,
+    };
+  }
+
+  const scale3 = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+  const dominant = (w) => [0, 1, 2].reduce((m, k) => (Math.abs(w[k]) > Math.abs(w[m]) ? k : m), 0);
+
+  // Rotate v about x by ω, then about y by φ, then about z by κ (all in degrees).
+  function rotate(v, omega, phi, kappa) {
+    const r = Math.PI / 180;
+    const co = Math.cos(omega * r), so = Math.sin(omega * r);
+    const cf = Math.cos(phi * r), sf = Math.sin(phi * r);
+    const ck = Math.cos(kappa * r), sk = Math.sin(kappa * r);
+    let [x, y, z] = v;
+    [y, z] = [y * co - z * so, y * so + z * co];
+    [x, z] = [x * cf + z * sf, -x * sf + z * cf];
+    [x, y] = [x * ck - y * sk, x * sk + y * ck];
+    return [x, y, z];
+  }
+  function presetOf(s) {
+    return Object.keys(PRESETS).find((key) => {
+      const p = PRESETS[key];
+      return p.omega === s.omega && p.phi === s.phi && p.kappa === s.kappa;
+    }) || null;
+  }
+  // Everything the shaders and guides need about the sheet, derived from the state.
+  function computeSheet(vol) {
+    const { omega, phi, kappa, sphere } = state;
+    const U = rotate([1, 0, 0], omega, phi, kappa);   // the sheet's rightward direction
+    const V = rotate([0, -1, 0], omega, phi, kappa);  // its downward direction
+    const N = rotate([0, 0, 1], omega, phi, kappa);   // its normal; depth 0 starts on this side
+    const reach = (w) => vol.half[0] * Math.abs(w[0]) + vol.half[1] * Math.abs(w[1]) + vol.half[2] * Math.abs(w[2]);
+    const extent = [reach(U), reach(V)];  // the block's shadow on the sheet: as much sheet as can ever touch it
+    const D = reach(N);
+    // Sphereness wraps the sheet around a sphere behind it; at 1 its corners meet and the sphere closes.
+    const bend = sphere > 0.001 ? (sphere * Math.PI) / Math.hypot(extent[0], extent[1]) : 0;  // radians per unit of arc
+    const R = bend ? 1 / bend : 0;
+    const sag = bend ? R * (1 - Math.cos(sphere * Math.PI)) : 0;  // how far the rim trails behind the centre
+    let offset = D - state.depth * (2 * D + sag);  // the centre's distance from the middle of the block, along N
+    const axis = dominant(N);
+    const aligned = Math.abs(N[axis]) > 0.9999;
+    if (aligned && !bend) {  // square to an axis: sit exactly on a layer of voxels so frames stay crisp
+      offset = worldCoord(vol, axis, Math.round(indexAt(vol, axis, N[axis] * offset))) / N[axis];
+    }
+    const steps = [0, 1, 2].map((k) => spacing(vol, k));
+    const stepAlong = (w) => 1 / Math.hypot(w[0] / steps[0], w[1] / steps[1], w[2] / steps[2]);  // one voxel along w
+    const grid = [extent[0] / stepAlong(U), extent[1] / stepAlong(V)].map((n) => clamp(Math.round(2 * n) + 1, 2, 640));
+    const weight = Math.abs(N[0]) + Math.abs(N[1]) + Math.abs(N[2]);
+    const color = [0, 1, 2].map((c) => [0, 1, 2].reduce((sum, k) => sum + Math.abs(N[k]) * AXIS_RGB[k][c], 0) / weight);
+    return {
+      U, V, N, C: scale3(N, offset), extent, D, bend, R, sag, axis, grid, color,
+      cell: Math.max((2 * extent[0]) / (grid[0] - 1), (2 * extent[1]) / (grid[1] - 1)),
+      ends: [scale3(N, D), scale3(N, -D - sag)],  // where the centre sits at depth 0 and at depth 1
+      depthStep: stepAlong(N) / (2 * D + sag),     // one voxel of depth
+      kind: bend ? 'curved' : aligned ? ['zy', 'xz', 'xy'][axis] : 'tilted',
+    };
+  }
+  // Signed distance of p from the sheet, positive on the side its normal points to.
+  function sideOf(sh, p) {
+    if (!sh.bend) return (p[0] - sh.C[0]) * sh.N[0] + (p[1] - sh.C[1]) * sh.N[1] + (p[2] - sh.C[2]) * sh.N[2];
+    const O = sh.C.map((c, k) => c - sh.R * sh.N[k]);
+    return Math.hypot(p[0] - O[0], p[1] - O[1], p[2] - O[2]) - sh.R;
   }
 
   // ---------- shaders ----------
@@ -139,20 +206,45 @@ vec3 toWorld(ivec3 v) {
   vec3 n = vec3(v) / vec3(max(uDim - 1, ivec3(1)));
   return vec3(mix(-uHalf.x, uHalf.x, n.x), mix(uHalf.y, -uHalf.y, n.y), mix(uHalf.z, -uHalf.z, n.z));
 }
-// Voxel for slot 'id' of the slice through plane 'axis' at 'index'; slots run along u first, then v.
-ivec3 sliceVoxel(int axis, int index, int id) {
-  if (axis == 2) return ivec3(id % uDim.x, id / uDim.x, index);  // XY: u = x, v = y
-  if (axis == 1) return ivec3(id % uDim.x, index, id / uDim.x);  // XZ: u = x, v = z
-  return ivec3(index, id / uDim.z, id % uDim.z);                 // ZY: u = z, v = y
+// world position -> fractional voxel index
+vec3 toIndex(vec3 p) {
+  return vec3(p.x + uHalf.x, uHalf.y - p.y, uHalf.z - p.z) / (2.0 * uHalf) * vec3(max(uDim - 1, ivec3(1)));
+}
+bool inBlock(vec3 i) {
+  return all(greaterThanEqual(i, vec3(-0.5))) && all(lessThanEqual(i, vec3(uDim) - 0.5)) && i.z <= float(uLoaded) - 0.5;
+}
+vec3 colorAt(vec3 i) {
+  return texture(uVol, (i + 0.5) / vec3(uDim)).rgb;
+}
+`;
+  const SHEET = `
+uniform vec3 uC;       // the sheet's centre
+uniform vec3 uU;       // its rightward and downward directions
+uniform vec3 uV;
+uniform vec3 uN;       // its normal
+uniform vec2 uExtent;  // half its width and height, in world units
+uniform ivec2 uSheetGrid;
+uniform float uBend;   // radians of sphere per unit of arc; 0 keeps it flat
+// sheet coordinates (arc length from the centre) -> world position
+vec3 sheetPoint(vec2 uv) {
+  float rho = length(uv);
+  if (uBend < 1e-5 || rho < 1e-6) return uC + uv.x * uU + uv.y * uV;
+  float theta = rho * uBend, r = 1.0 / uBend;
+  vec2 d = uv / rho;
+  return uC + r * (cos(theta) - 1.0) * uN + r * sin(theta) * (d.x * uU + d.y * uV);
+}
+vec2 sheetCoord(ivec2 g) {
+  return (vec2(g) / vec2(max(uSheetGrid - 1, ivec2(1))) * 2.0 - 1.0) * uExtent;
 }
 `;
   const CLOUD_VS = HEAD + VOLUME + `
 uniform ivec3 uGrid;
 uniform mat4 uMVP;
 uniform float uSize;
-uniform int uAxis;
-uniform float uCut;
-uniform float uSide;  // +1 hides points past the cut, -1 hides points before it, 0 keeps all
+uniform vec3 uCutC;
+uniform vec3 uCutN;
+uniform float uCutR;  // radius of a bent sheet's sphere; 0 when flat
+uniform float uSide;  // +1 hides the side the sheet's normal points to, -1 the other side, 0 keeps all
 uniform float uAlpha;
 out vec4 vColor;
 void main() {
@@ -161,25 +253,44 @@ void main() {
   ivec3 span = max(uGrid - 1, ivec3(1));
   ivec3 v = (g * (uDim - 1) * 2 + span) / (span * 2);  // nearest voxel to this grid point
   vec3 p = toWorld(v);
+  float side = uCutR > 0.0 ? length(p - (uCutC - uCutR * uCutN)) - uCutR : dot(p - uCutC, uCutN);
   vec4 clip = uMVP * vec4(p, 1.0);
-  bool hidden = v.z >= uLoaded || uSide * (p[uAxis] - uCut) > 1e-4;
+  bool hidden = v.z >= uLoaded || uSide * side > 1e-4;
   gl_Position = hidden ? vec4(0.0, 0.0, 2.0, 1.0) : clip;
   gl_PointSize = hidden ? 0.0 : clamp(uSize / clip.w, 1.0, 48.0);
   vColor = vec4(texelFetch(uVol, v, 0).rgb, uAlpha);
 }`;
-  const SLICE_VS = HEAD + VOLUME + `
-uniform int uSliceAxis;
-uniform int uIndex;
+  const SHEET3D_VS = HEAD + VOLUME + SHEET + `
 uniform mat4 uMVP;
 uniform float uSize;
+uniform vec3 uEdge;
 out vec4 vColor;
 void main() {
-  ivec3 v = sliceVoxel(uSliceAxis, uIndex, gl_VertexID);
-  vec4 clip = uMVP * vec4(toWorld(v), 1.0);
-  bool hidden = v.z >= uLoaded;
-  gl_Position = hidden ? vec4(0.0, 0.0, 2.0, 1.0) : clip;
-  gl_PointSize = hidden ? 0.0 : clamp(uSize / clip.w, 1.0, 48.0);
-  vColor = vec4(texelFetch(uVol, v, 0).rgb, 1.0);
+  ivec2 g = ivec2(gl_VertexID % uSheetGrid.x, gl_VertexID / uSheetGrid.x);
+  vec2 uv = sheetCoord(g);
+  vec2 step = 2.0 * uExtent / vec2(max(uSheetGrid - 1, ivec2(1)));
+  vec3 p = sheetPoint(uv);
+  vec3 i = toIndex(p);
+  bool inside = inBlock(i);
+  // the sheet's outline: points inside the block with a neighbour outside it
+  bool edge = inside && !(inBlock(toIndex(sheetPoint(uv + vec2(step.x, 0.0)))) && inBlock(toIndex(sheetPoint(uv - vec2(step.x, 0.0))))
+    && inBlock(toIndex(sheetPoint(uv + vec2(0.0, step.y)))) && inBlock(toIndex(sheetPoint(uv - vec2(0.0, step.y)))));
+  vec4 clip = uMVP * vec4(p, 1.0);
+  gl_Position = inside ? clip : vec4(0.0, 0.0, 2.0, 1.0);
+  gl_PointSize = inside ? clamp(uSize * (edge ? 1.5 : 1.0) / clip.w, 1.0, 48.0) : 0.0;
+  vColor = vec4(edge ? uEdge : colorAt(i), 1.0);
+}`;
+  const SHEET2D_VS = HEAD + VOLUME + SHEET + `
+uniform vec4 uRect;  // left, bottom, width, height in clip space
+uniform vec2 uDot;   // dot diameter in pixels along u and v
+out vec4 vColor;
+void main() {
+  ivec2 g = ivec2(gl_VertexID % uSheetGrid.x, gl_VertexID / uSheetGrid.x);
+  vec3 i = toIndex(sheetPoint(sheetCoord(g)));
+  vec2 c = (vec2(g) + 0.5) / vec2(uSheetGrid);
+  gl_Position = vec4(uRect.xy + vec2(c.x, 1.0 - c.y) * uRect.zw, 0.0, 1.0);
+  gl_PointSize = max(uDot.x, uDot.y);
+  vColor = inBlock(i) ? vec4(colorAt(i), 1.0) : vec4(0.0);
 }`;
   const POINT_FS = HEAD + `
 in vec4 vColor;
@@ -189,24 +300,7 @@ void main() {
   if (dot(d, d) > 0.25) discard;
   outColor = vColor;
 }`;
-  const FLAT_VS = HEAD + VOLUME + `
-uniform int uSliceAxis;
-uniform int uIndex;
-uniform ivec2 uGridUV;
-uniform vec4 uRect;  // left, bottom, width, height in clip space
-uniform vec2 uDot;   // dot diameter in pixels along u and v
-uniform bool uVUp;   // v grows upward (time in XZ) instead of downward (rows)
-out vec4 vColor;
-void main() {
-  int id = gl_VertexID;
-  ivec3 v = sliceVoxel(uSliceAxis, uIndex, id);
-  vec2 c = (vec2(ivec2(id % uGridUV.x, id / uGridUV.x)) + 0.5) / vec2(uGridUV);
-  if (!uVUp) c.y = 1.0 - c.y;
-  gl_Position = vec4(uRect.xy + c * uRect.zw, 0.0, 1.0);
-  gl_PointSize = max(uDot.x, uDot.y);
-  vColor = v.z < uLoaded ? vec4(texelFetch(uVol, v, 0).rgb, 1.0) : vec4(0.0);
-}`;
-  const FLAT_FS = HEAD + `
+  const DOT_FS = HEAD + `
 uniform vec2 uDot;
 in vec4 vColor;
 out vec4 outColor;
@@ -269,7 +363,7 @@ void main() {
     return { program, u: new Proxy(locations, { get: (t, name) => t[name] ?? null }) };
   }
 
-  // Screen-sized dots for guides, rails, handles and crosshairs.
+  // Screen-sized dots for guides, paths and handles.
   class Overlay {
     constructor(gl) {
       this.gl = gl;
@@ -328,8 +422,10 @@ void main() {
       if (this.texture) gl.deleteTexture(this.texture);
       this.texture = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_3D, this.texture);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      // the block's own points read exact voxels; a tilted or bent sheet blends its neighbours
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      for (const wrap of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.texParameteri(gl.TEXTURE_3D, wrap, gl.CLAMP_TO_EDGE);
       gl.texStorage3D(gl.TEXTURE_3D, 1, gl.RGBA8, vol.W, vol.H, vol.T);
       this.dirty = true;
     }
@@ -365,6 +461,16 @@ void main() {
       gl.uniform3f(p.u.uHalf, vol.half[0], vol.half[1], vol.half[2]);
       gl.uniform1i(p.u.uLoaded, vol.loaded);
     }
+    useSheet(p, sh) {
+      const gl = this.gl;
+      gl.uniform3fv(p.u.uC, sh.C);
+      gl.uniform3fv(p.u.uU, sh.U);
+      gl.uniform3fv(p.u.uV, sh.V);
+      gl.uniform3fv(p.u.uN, sh.N);
+      gl.uniform2f(p.u.uExtent, sh.extent[0], sh.extent[1]);
+      gl.uniform2i(p.u.uSheetGrid, sh.grid[0], sh.grid[1]);
+      gl.uniform1f(p.u.uBend, sh.bend);
+    }
   }
 
   // ---------- left: the block in 3D ----------
@@ -372,13 +478,13 @@ void main() {
     constructor(canvas, labels) {
       super(canvas);
       this.cloud = createProgram(this.gl, CLOUD_VS, POINT_FS);
-      this.slice = createProgram(this.gl, SLICE_VS, POINT_FS);
+      this.surface = createProgram(this.gl, SHEET3D_VS, POINT_FS);
       this.labels = labels;
       this.cam = { yaw: 0.62, pitch: 0.42, zoom: 1, vYaw: 0, vPitch: 0 };
-      this.handles = [];  // CSS px of each plane's handle, by axis
-      this.rails = [];    // CSS px of each rail's two ends, by axis
-      this.hover = -1;
-      this.grabbed = -1;
+      this.handle = null;  // CSS px of the sheet's handle
+      this.rail = null;    // CSS px of the two ends of the path it slides along
+      this.hover = false;
+      this.grabbed = false;
       this.orbiting = false;
       this.listen();
     }
@@ -386,7 +492,7 @@ void main() {
       Object.assign(this.cam, { yaw: 0.62, pitch: 0.42, zoom: 1, vYaw: 0, vPitch: 0 });
       this.dirty = true;
     }
-    rotate(dYaw, dPitch) {
+    orbit(dYaw, dPitch) {
       this.cam.yaw += dYaw;
       this.cam.pitch = clamp(this.cam.pitch + dPitch, -1.45, 1.45);
       this.dirty = true;
@@ -398,14 +504,14 @@ void main() {
     tick() {  // orbit inertia after a flick
       const c = this.cam;
       if (this.orbiting || (Math.abs(c.vYaw) < 1e-4 && Math.abs(c.vPitch) < 1e-4)) return;
-      this.rotate(c.vYaw, c.vPitch);
+      this.orbit(c.vYaw, c.vPitch);
       c.vYaw *= 0.9;
       c.vPitch *= 0.9;
     }
     camera(half) {
       const fov = (34 * Math.PI) / 180;
       const aspect = this.width / this.height;
-      const radius = Math.hypot(half[0] + RAIL_GAP, half[1] + RAIL_GAP, half[2] + RAIL_GAP);
+      const radius = Math.hypot(half[0] + 0.14, half[1] + 0.14, half[2] + 0.14);
       const fit = aspect >= 1 ? fov : 2 * Math.atan(Math.tan(fov / 2) * aspect);
       const dist = (radius / Math.sin(fit / 2)) * 0.9 * this.cam.zoom;
       const { yaw, pitch } = this.cam;
@@ -418,48 +524,45 @@ void main() {
       const vol = state.vol;
       const half = vol ? vol.half : [1, 0.5625, 1];
       const { mvp, eye, focal } = this.camera(half);
-      if (vol && this.texture) this.drawVolume(vol, mvp, eye, focal);
-      this.drawGuides(vol, half, mvp);
+      if (vol && this.texture && sheet) this.drawVolume(vol, sheet, mvp, eye, focal);
+      this.drawGuides(vol ? sheet : null, half, mvp);
     }
-    drawVolume(vol, mvp, eye, focal) {
-      const gl = this.gl, k = state.active;
+    drawVolume(vol, sh, mvp, eye, focal) {
+      const gl = this.gl;
       const ghost = state.mode === 'ghost';
       const sampling = vol.loaded < vol.T;
       gl.enable(gl.DEPTH_TEST);
       gl.depthMask(true);
       gl.bindVertexArray(this.vao);
 
-      // Full-resolution slices: the active plane on the cut face, or all three planes in ghost mode.
-      const sp = this.slice;
+      // The sheet at full resolution, outlined where it leaves the block.
+      const sp = this.surface;
       this.useVolume(sp, vol);
+      this.useSheet(sp, sh);
       gl.uniformMatrix4fv(sp.u.uMVP, false, mvp);
-      const planes = ghost ? [0, 1, 2] : sampling ? [] : [k];
-      for (const a of planes) {
-        const [u, v] = UV_AXES[a];
-        gl.uniform1i(sp.u.uSliceAxis, a);
-        gl.uniform1i(sp.u.uIndex, state.pos[a]);
-        gl.uniform1f(sp.u.uSize, Math.max(spacing(vol, u), spacing(vol, v)) * focal * state.pointScale);
-        gl.drawArrays(gl.POINTS, 0, vol.dims[u] * vol.dims[v]);
-      }
+      gl.uniform1f(sp.u.uSize, sh.cell * focal * state.pointScale);
+      gl.uniform3fv(sp.u.uEdge, sh.color);
+      gl.drawArrays(gl.POINTS, 0, sh.grid[0] * sh.grid[1]);
 
-      // The block itself, cut away between the camera and the active plane.
+      // The block: a faint haze in ghost mode, or cut away between the camera and the sheet.
       const cp = this.cloud;
-      const cut = worldCoord(vol, k, state.pos[k]);
+      const grid = ghost ? vol.ghostGrid : vol.grid;
       this.useVolume(cp, vol);
       gl.uniformMatrix4fv(cp.u.uMVP, false, mvp);
-      gl.uniform3i(cp.u.uGrid, vol.grid[0], vol.grid[1], vol.grid[2]);
-      gl.uniform1i(cp.u.uAxis, k);
-      gl.uniform1f(cp.u.uCut, cut);
-      gl.uniform1f(cp.u.uSide, ghost || sampling ? 0 : eye[k] >= cut ? 1 : -1);
-      gl.uniform1f(cp.u.uAlpha, ghost ? 0.05 : 1);
-      gl.uniform1f(cp.u.uSize, vol.cloudSpacing * focal * state.pointScale * (ghost ? 0.8 : 1));
+      gl.uniform3i(cp.u.uGrid, grid[0], grid[1], grid[2]);
+      gl.uniform3fv(cp.u.uCutC, sh.C);
+      gl.uniform3fv(cp.u.uCutN, sh.N);
+      gl.uniform1f(cp.u.uCutR, sh.R);
+      gl.uniform1f(cp.u.uSide, ghost || sampling ? 0 : sideOf(sh, eye) >= 0 ? 1 : -1);
+      gl.uniform1f(cp.u.uAlpha, ghost ? GHOST_ALPHA : 1);
+      gl.uniform1f(cp.u.uSize, (ghost ? vol.ghostSpacing : vol.cloudSpacing) * focal * state.pointScale);
       if (ghost) gl.depthMask(false);
-      gl.drawArrays(gl.POINTS, 0, vol.grid[0] * vol.grid[1] * vol.grid[2]);
+      gl.drawArrays(gl.POINTS, 0, grid[0] * grid[1] * grid[2]);
       gl.depthMask(true);
       gl.bindVertexArray(null);
       gl.disable(gl.DEPTH_TEST);
     }
-    drawGuides(vol, half, mvp) {
+    drawGuides(sh, half, mvp) {
       const ov = this.overlay, px = this.dpr, [a, b, c] = half;
       const cw = this.cssWidth, ch = this.cssHeight;
       ov.clear();
@@ -467,59 +570,37 @@ void main() {
       for (const z of [-c, c]) for (const y of [-b, b]) for (const x of [-a, a]) corners.push([x, y, z]);
       for (const [i, j] of BOX_EDGES) ov.line(corners[i], corners[j], WHITE, 0.2, 1.5 * px, 0.035);
 
-      this.handles = [];
-      this.rails = [];
-      if (vol) {
-        const knobs = [];
-        for (let k = 0; k < 3; k++) {
-          const color = AXIS_RGB[k], active = k === state.active;
-          const w = worldCoord(vol, k, state.pos[k]);
-          const rect = planeCorners(half, k, w);
-          for (let e = 0; e < 4; e++) ov.line(rect[e], rect[(e + 1) % 4], color, active ? 0.95 : 0.45, (active ? 2.6 : 1.7) * px, 0.03);
-          const r0 = railPoint(half, k, worldCoord(vol, k, 0));
-          const r1 = railPoint(half, k, worldCoord(vol, k, vol.dims[k] - 1));
-          ov.line(r0, r1, color, 0.38, 1.6 * px, 0.04);
-          ov.point(r0, color, 0.8, 5 * px);
-          ov.point(r1, color, 0.8, 5 * px);
-          const h = railPoint(half, k, w);
-          ov.line(h, planeAnchor(half, k, w), color, 0.75, 1.4 * px, 0.02);
-          knobs.push({ k, h, active });
-          this.handles[k] = project(mvp, h, cw, ch);
-          this.rails[k] = [project(mvp, r0, cw, ch), project(mvp, r1, cw, ch)];
-        }
-        knobs.sort((p, q) => p.active - q.active);  // active handle on top
-        for (const { k, h, active } of knobs) {
-          const lit = k === this.hover || k === this.grabbed;
-          ov.point(h, AXIS_RGB[k], 1, (lit ? 25 : active ? 21 : 17) * px, 1);
-        }
+      this.handle = this.rail = null;
+      if (sh) {
+        const [e0, e1] = sh.ends;  // the path the sheet's centre slides along
+        ov.line(e0, e1, sh.color, 0.45, 1.6 * px, 0.04);
+        ov.point(e0, sh.color, 0.8, 5 * px);
+        ov.point(e1, sh.color, 0.8, 5 * px);
+        ov.point(sh.C, sh.color, 1, (this.hover || this.grabbed ? 25 : 21) * px, 1);
+        this.handle = project(mvp, sh.C, cw, ch);
+        this.rail = [project(mvp, e0, cw, ch), project(mvp, e1, cw, ch)];
       }
       ov.draw(mvp);
 
-      const spots = [[-a - 0.12, -b - RAIL_GAP, c + RAIL_GAP], [a + RAIL_GAP, b + 0.13, c + RAIL_GAP], [a + RAIL_GAP, -b - RAIL_GAP, -c - 0.16]];
+      const gap = 0.12;
+      const spots = [[0, -b - gap, c + gap], [a + gap, 0, c + gap], [a + gap, -b - gap, 0]];
       this.labels.forEach((el, k) => {
-        el.hidden = !vol;
-        if (!vol) return;
+        el.hidden = !sh;
+        if (!sh) return;
         const [x, y] = project(mvp, spots[k], cw, ch);
         const hw = el.offsetWidth / 2 + 8, hh = el.offsetHeight / 2 + 8;  // keep the label inside the view
         el.style.transform = `translate(${clamp(x, hw, cw - hw).toFixed(1)}px, ${clamp(y, hh, ch - hh).toFixed(1)}px) translate(-50%, -50%)`;
       });
     }
-    pickHandle(p, reach = 18) {
-      let best = -1, bestDist = reach;
-      this.handles.forEach((h, k) => {
-        const d = Math.hypot(h[0] - p[0], h[1] - p[1]);
-        if (d < bestDist) { bestDist = d; best = k; }
-      });
-      return best;
+    nearHandle(p, reach) {
+      return Boolean(this.handle) && Math.hypot(this.handle[0] - p[0], this.handle[1] - p[1]) < reach;
     }
-    dragHandle(k, p) {
-      const vol = state.vol, rail = this.rails[k];
-      if (!vol || !rail) return;
-      const [r0, r1] = rail;
+    dragHandle(p) {
+      if (!this.rail) return;
+      const [r0, r1] = this.rail;
       const dx = r1[0] - r0[0], dy = r1[1] - r0[1], len2 = dx * dx + dy * dy;
-      if (len2 < 64) return;  // rail seen end-on
-      const u = clamp(((p[0] - r0[0]) * dx + (p[1] - r0[1]) * dy) / len2, 0, 1);
-      setPos(k, u * (vol.dims[k] - 1));
+      if (len2 < 64) return;  // path seen end-on
+      setDepth(((p[0] - r0[0]) * dx + (p[1] - r0[1]) * dy) / len2);
     }
     listen() {
       const c = this.canvas, pointers = new Map();
@@ -537,12 +618,11 @@ void main() {
           this.orbiting = false;
           return;
         }
-        const p = local(e), k = this.pickHandle(p, e.pointerType === 'mouse' ? 18 : 32);  // fingers need a bigger target
-        if (k >= 0) {
-          drag = { type: 'handle', k };
-          this.grabbed = k;
-          setActive(k);
-          this.dragHandle(k, p);
+        const p = local(e);
+        if (this.nearHandle(p, e.pointerType === 'mouse' ? 18 : 32)) {  // fingers need a bigger target
+          drag = { type: 'handle' };
+          this.grabbed = true;
+          this.dragHandle(p);
           c.style.cursor = 'grabbing';
         } else {
           drag = { type: 'orbit', p, at: e.timeStamp };
@@ -554,20 +634,20 @@ void main() {
         const p = local(e);
         if (pointers.has(e.pointerId)) pointers.set(e.pointerId, p);
         if (!drag) {
-          const k = this.pickHandle(p);
-          if (k !== this.hover) { this.hover = k; this.dirty = true; }
-          c.style.cursor = k >= 0 ? 'grab' : '';
+          const near = this.nearHandle(p, 18);
+          if (near !== this.hover) { this.hover = near; this.dirty = true; }
+          c.style.cursor = near ? 'grab' : '';
           return;
         }
         if (drag.type === 'handle') {
-          this.dragHandle(drag.k, p);
+          this.dragHandle(p);
         } else if (drag.type === 'orbit') {
           const dx = p[0] - drag.p[0], dy = p[1] - drag.p[1];
           drag.p = p;
           drag.at = e.timeStamp;
           this.cam.vYaw = -dx * 0.0085;
           this.cam.vPitch = dy * 0.0085;
-          this.rotate(this.cam.vYaw, this.cam.vPitch);
+          this.orbit(this.cam.vYaw, this.cam.vPitch);
         } else if (drag.type === 'pinch' && pointers.size === 2) {
           const [p0, p1] = [...pointers.values()];
           this.zoomTo((drag.zoom * drag.span) / Math.max(1, Math.hypot(p0[0] - p1[0], p0[1] - p1[1])));
@@ -582,7 +662,7 @@ void main() {
         this.cam.vPitch = clamp(this.cam.vPitch, -0.025, 0.025);
         drag = null;
         this.orbiting = false;
-        this.grabbed = -1;
+        this.grabbed = false;
         c.style.cursor = '';
         this.dirty = true;
       };
@@ -597,98 +677,77 @@ void main() {
     }
   }
 
-  // ---------- right: the points on the active plane ----------
+  // ---------- right: the points the sheet touches, laid out flat ----------
   class SliceView extends GLView {
     constructor(canvas, labelU, labelV) {
       super(canvas);
-      this.flat = createProgram(this.gl, FLAT_VS, FLAT_FS);
+      this.flat = createProgram(this.gl, SHEET2D_VS, DOT_FS);
       this.labelU = labelU;
       this.labelV = labelV;
       this.box = null;
       this.listen();
     }
-    layout(vol) {
-      const k = state.active, [ua, va] = UV_AXES[k];
-      const ew = 2 * vol.half[ua], eh = 2 * vol.half[va];
-      const pad = 38;
-      const s = Math.max(0, Math.min((this.cssWidth - 2 * pad) / ew, (this.cssHeight - 2 * pad) / eh));
-      const w = ew * s, h = eh * s;
-      return { x: (this.cssWidth - w) / 2, y: (this.cssHeight - h) / 2, w, h, ua, va, U: vol.dims[ua], V: vol.dims[va], up: k === 1 };
-    }
-    xAt(box, i) { return box.x + ((i + 0.5) / box.U) * box.w; }
-    yAt(box, j) {
-      const f = (j + 0.5) / box.V;
-      return box.up ? box.y + box.h - f * box.h : box.y + f * box.h;
-    }
     render() {
       this.begin();
-      const vol = state.vol;
-      if (!vol || !this.texture) return;
-      const gl = this.gl, p = this.flat, box = (this.box = this.layout(vol));
-      const W = this.cssWidth, H = this.cssHeight;
+      const vol = state.vol, sh = sheet;
+      this.box = null;
+      if (!vol || !this.texture || !sh) {
+        this.labelU.hidden = this.labelV.hidden = true;
+        return;
+      }
+      const W = this.cssWidth, H = this.cssHeight, pad = 38;
+      const ew = 2 * sh.extent[0], eh = 2 * sh.extent[1];
+      const s = Math.max(0, Math.min((W - 2 * pad) / ew, (H - 2 * pad) / eh));
+      const box = (this.box = { w: ew * s, h: eh * s });
+      box.x = (W - box.w) / 2;
+      box.y = (H - box.h) / 2;
+
+      const gl = this.gl, p = this.flat;
       this.useVolume(p, vol);
-      gl.uniform1i(p.u.uSliceAxis, state.active);
-      gl.uniform1i(p.u.uIndex, state.pos[state.active]);
-      gl.uniform2i(p.u.uGridUV, box.U, box.V);
+      this.useSheet(p, sh);
       gl.uniform4f(p.u.uRect, (box.x / W) * 2 - 1, 1 - ((box.y + box.h) / H) * 2, (box.w / W) * 2, (box.h / H) * 2);
       const fill = 0.9 * state.pointScale;
-      gl.uniform2f(p.u.uDot, (box.w / box.U) * this.dpr * fill, (box.h / box.V) * this.dpr * fill);
-      gl.uniform1i(p.u.uVUp, box.up ? 1 : 0);
+      gl.uniform2f(p.u.uDot, (box.w / sh.grid[0]) * this.dpr * fill, (box.h / sh.grid[1]) * this.dpr * fill);
       gl.bindVertexArray(this.vao);
-      gl.drawArrays(gl.POINTS, 0, box.U * box.V);
+      gl.drawArrays(gl.POINTS, 0, sh.grid[0] * sh.grid[1]);
       gl.bindVertexArray(null);
 
-      // Crosshair: where the other two planes cross this one.
-      const ov = this.overlay, px = this.dpr;
-      const x = this.xAt(box, state.pos[box.ua]), y = this.yAt(box, state.pos[box.va]);
-      const cu = AXIS_RGB[box.ua], cv = AXIS_RGB[box.va];
-      ov.clear();
-      ov.line([x, box.y, 0], [x, box.y + box.h, 0], cu, 0.35, 1.5 * px, 7);
-      ov.line([box.x, y, 0], [box.x + box.w, y, 0], cv, 0.35, 1.5 * px, 7);
-      ov.point([x, box.y - 10, 0], cu, 1, 7 * px);
-      ov.point([x, box.y + box.h + 10, 0], cu, 1, 7 * px);
-      ov.point([box.x - 10, y, 0], cv, 1, 7 * px);
-      ov.point([box.x + box.w + 10, y, 0], cv, 1, 7 * px);
-      ov.draw(new Float32Array([2 / W, 0, 0, 0, 0, -2 / H, 0, 0, 0, 0, 1, 0, -1, 1, 0, 1]));
-
-      this.labelU.textContent = `${AXIS_NAMES[box.ua]} →`;
-      this.labelV.textContent = box.up ? `${AXIS_NAMES[box.va]} →` : `← ${AXIS_NAMES[box.va]}`;
-      this.labelU.style.setProperty('--c', `var(${AXIS_TOKENS[box.ua]})`);
-      this.labelV.style.setProperty('--c', `var(${AXIS_TOKENS[box.va]})`);
-      this.labelU.style.transform = `translate(${box.x + box.w / 2}px, ${box.y + box.h + 26}px) translate(-50%, -50%)`;
-      this.labelV.style.transform = `translate(${box.x - 26}px, ${box.y + box.h / 2}px) translate(-50%, -50%) rotate(-90deg)`;
+      this.placeLabel(this.labelU, sh.U, false, box.x + box.w / 2, box.y + box.h + 26, '');
+      this.placeLabel(this.labelV, sh.V, true, box.x - 26, box.y + box.h / 2, ' rotate(-90deg)');
+    }
+    // Name the block axis a sheet direction runs along, when it runs close to one.
+    placeLabel(el, w, down, x, y, turn) {
+      const k = dominant(w);
+      el.hidden = Math.abs(w[k]) < 0.9;
+      if (el.hidden) return;
+      const grows = w[k] * (k === 0 ? 1 : -1) > 0;  // the voxel index grows along w
+      el.textContent = grows !== down ? `${AXIS_NAMES[k]} →` : `← ${AXIS_NAMES[k]}`;
+      el.style.setProperty('--c', `var(${AXIS_TOKENS[k]})`);
+      el.style.transform = `translate(${x}px, ${y}px) translate(-50%, -50%)${turn}`;
     }
     listen() {
       const c = this.canvas;
-      let probing = false, wheel = 0;
-      // Click or drag to place the crosshair: it moves the other two planes to that point.
-      const probe = (e) => {
-        const box = this.box;
-        if (!box || !state.vol) return;
-        const r = c.getBoundingClientRect();
-        const fu = (e.clientX - r.left - box.x) / box.w;
-        const fv = (e.clientY - r.top - box.y) / box.h;
-        setPos(box.ua, Math.floor(fu * box.U));
-        setPos(box.va, Math.floor((box.up ? 1 - fv : fv) * box.V));
-      };
+      let drag = null, wheel = 0;
+      // Drag sideways to push the sheet through the block, like scrubbing a video.
       c.addEventListener('pointerdown', (e) => {
         if (!this.box) return;
-        probing = true;
+        drag = { x: e.clientX, depth: state.depth };
         c.setPointerCapture(e.pointerId);
-        probe(e);
       });
-      c.addEventListener('pointermove', (e) => { if (probing) probe(e); });
-      const stop = () => { probing = false; };
+      c.addEventListener('pointermove', (e) => {
+        if (drag && this.box) setDepth(drag.depth + (e.clientX - drag.x) / Math.max(1, this.box.w));
+      });
+      const stop = () => { drag = null; };
       c.addEventListener('pointerup', stop);
       c.addEventListener('pointercancel', stop);
       c.addEventListener('wheel', (e) => {
-        if (!state.vol) return;
+        if (!sheet) return;
         e.preventDefault();
         wheel += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;  // trackpads send many small deltas
         const steps = Math.trunc(wheel / 24);
         if (steps) {
           wheel -= steps * 24;
-          setPos(state.active, state.pos[state.active] + steps);
+          setDepth(state.depth + steps * sheet.depthStep);
         }
       }, { passive: false });
     }
@@ -706,14 +765,16 @@ void main() {
     quality: $('#quality'),
     meta: $('#meta'),
     viewport: $('.viewport'),
-    sliders: [$('#pos-x'), $('#pos-y'), $('#pos-z')],
-    values: [$('#val-x'), $('#val-y'), $('#val-z')],
-    rows: [...document.querySelectorAll('.slide')],
-    modeCut: $('#mode-cut'),
+    presets: [...document.querySelectorAll('[data-preset]')],
     modeGhost: $('#mode-ghost'),
+    modeCut: $('#mode-cut'),
+    depth: $('#depth'),
+    depthOut: $('#depth-out'),
+    angles: { omega: [$('#omega'), $('#omega-num')], phi: [$('#phi'), $('#phi-num')], kappa: [$('#kappa'), $('#kappa-num')] },
+    sphere: [$('#sphere'), $('#sphere-num')],
     size: $('#size'),
     reset: $('#reset'),
-    tabs: [...document.querySelectorAll('.tabs [data-axis]')],
+    sheetName: $('#sheet-name'),
     play: $('#play'),
     speeds: [...document.querySelectorAll('[data-speed]')],
     readout: $('#readout'),
@@ -750,79 +811,82 @@ void main() {
     cube.dirty = true;
     slice.dirty = true;
   }
-  // While frames are still arriving, the time plane can only reach the ones already sampled.
-  function maxIndex(k) {
-    const vol = state.vol;
-    return k === 2 ? Math.max(0, vol.loaded - 1) : vol.dims[k] - 1;
-  }
   function secondsAt(i) {
     const vol = state.vol;
     return ((i + 0.5) / vol.T) * vol.duration;
   }
-  function describe(k, i, long) {
-    const vol = state.vol;
-    if (k === 2) return long ? `frame ${i + 1} / ${vol.T} · ${secondsAt(i).toFixed(2)} s` : `${secondsAt(i).toFixed(2)} s`;
-    if (k === 1) return long ? `row ${i + 1} / ${vol.H}` : `row ${i + 1}`;
-    return long ? `column ${i + 1} / ${vol.W}` : `col ${i + 1}`;
+  // Where the sheet is: in frames, rows or columns when it is square to an axis, otherwise as a share of the way.
+  function describeDepth(long) {
+    const vol = state.vol, sh = sheet;
+    if (!vol || !sh) return '';
+    if (sh.kind === 'xy' || sh.kind === 'xz' || sh.kind === 'zy') {
+      const i = Math.round(indexAt(vol, sh.axis, sh.C[sh.axis]));
+      if (sh.axis === 2) return long ? `frame ${i + 1} / ${vol.T} · ${secondsAt(i).toFixed(2)} s` : `${secondsAt(i).toFixed(2)} s`;
+      if (sh.axis === 1) return long ? `row ${i + 1} / ${vol.H}` : `row ${i + 1}`;
+      return long ? `column ${i + 1} / ${vol.W}` : `col ${i + 1}`;
+    }
+    return `${long ? 'depth ' : ''}${Math.round(state.depth * 100)}%`;
   }
   function syncFill(input) {
     const min = Number(input.min), max = Number(input.max);
     input.style.setProperty('--fill', `${((Number(input.value) - min) / Math.max(1e-9, max - min)) * 100}%`);
   }
-  function syncAxis(k) {
-    const vol = state.vol, input = ui.sliders[k];
-    input.max = String(vol.dims[k] - 1);
-    input.value = String(state.pos[k]);
-    syncFill(input);
-    ui.values[k].textContent = describe(k, state.pos[k], false);
-    if (k === state.active) ui.readout.textContent = describe(k, state.pos[k], true);
-  }
-  function setPos(k, i) {
-    if (!state.vol) return;
-    const next = clamp(Math.round(i), 0, maxIndex(k));
-    if (next === state.pos[k]) return;
-    state.pos[k] = next;
-    syncAxis(k);
+  // Recompute the sheet from the state and bring every control and label in line with it.
+  function update() {
+    sheet = state.vol ? computeSheet(state.vol) : null;
+    ui.depth.value = String(state.depth);
+    syncFill(ui.depth);
+    for (const [key, [range, number]] of [...Object.entries(ui.angles), ['sphere', ui.sphere]]) {
+      range.value = String(state[key]);
+      syncFill(range);
+      if (document.activeElement !== number) number.value = String(state[key]);
+    }
+    const preset = presetOf(state);
+    ui.presets.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.preset === preset)));
+    const kind = sheet ? sheet.kind : preset || 'tilted';
+    ui.sheetName.textContent = SHEET_NAMES[kind];
+    ui.explain.textContent = EXPLAIN[kind];
+    ui.depthOut.textContent = describeDepth(false);
+    ui.readout.textContent = describeDepth(true);
+    if (sheet) document.documentElement.style.setProperty('--sheet', `rgb(${sheet.color.map((v) => Math.round(v * 255)).join(' ')})`);
     requestDraw();
   }
-  function setActive(k) {
-    state.active = k;
-    ui.tabs.forEach((t) => t.setAttribute('aria-selected', String(Number(t.dataset.axis) === k)));
-    ui.rows.forEach((r) => r.classList.toggle('active', Number(r.dataset.axis) === k));
-    ui.explain.textContent = EXPLAIN[k];
-    if (state.vol) ui.readout.textContent = describe(k, state.pos[k], true);
-    playAcc = 0;
-    requestDraw();
+  function setDepth(d) {
+    state.depth = clamp(d, 0, 1);
+    update();
+  }
+  // Turn or bend the sheet about its centre: the handle stays put and the sheet pivots around it.
+  function reshape(changes) {
+    const pivot = sheet && sheet.C;
+    Object.assign(state, changes);
+    if (pivot) {
+      const sh = computeSheet(state.vol);
+      const offset = pivot[0] * sh.N[0] + pivot[1] * sh.N[1] + pivot[2] * sh.N[2];
+      state.depth = clamp((sh.D - offset) / (2 * sh.D + sh.sag), 0, 1);
+    }
+    update();
   }
   function setMode(mode) {
     state.mode = mode;
-    ui.modeCut.setAttribute('aria-pressed', String(mode === 'cut'));
     ui.modeGhost.setAttribute('aria-pressed', String(mode === 'ghost'));
+    ui.modeCut.setAttribute('aria-pressed', String(mode === 'cut'));
     requestDraw();
   }
 
-  // Play sweeps the active plane along its axis; at 1× a sweep lasts as long as the clip.
-  let playClock = 0, playAcc = 0;
+  // Play pushes the sheet through the block; at 1× one pass lasts as long as the clip.
+  let playClock = 0;
   function setPlaying(on) {
     state.playing = Boolean(on && state.vol);
     ui.play.innerHTML = state.playing ? ICON_PAUSE : ICON_PLAY;
     ui.play.setAttribute('aria-label', state.playing ? 'Pause' : 'Play');
     playClock = performance.now();
-    playAcc = 0;
   }
   function advancePlay(now) {
-    const vol = state.vol;
     const dt = Math.min(0.1, (now - playClock) / 1000);
     playClock = now;
-    if (!state.playing || !vol) return;
-    const k = state.active, n = maxIndex(k) + 1;
-    if (n < 2) return;
-    playAcc += (dt * state.speed * (vol.dims[k] - 1)) / vol.duration;
-    const steps = Math.floor(playAcc);
-    if (steps > 0) {
-      playAcc -= steps;
-      setPos(k, (state.pos[k] + steps) % n);
-    }
+    if (!state.playing || !state.vol) return;
+    const next = state.depth + (dt * state.speed) / state.vol.duration;
+    setDepth(next > 1 ? next - 1 : next);
   }
 
   // ---------- turning video into points ----------
@@ -831,28 +895,26 @@ void main() {
   function beginVolume(vol) {
     state.vol = vol;
     views.forEach((v) => v.setVolume(vol));
-    state.pos = [Math.floor(vol.W / 2), Math.floor(vol.H / 2), 0];
-    for (let k = 0; k < 3; k++) syncAxis(k);
+    state.depth = 0;
     const points = vol.grid[0] * vol.grid[1] * vol.grid[2];
     ui.meta.textContent = `${vol.W} × ${vol.H} px · ${vol.T} frames · ${points.toLocaleString('en-US')} points`;
-    requestDraw();
+    update();
   }
   function pushFrame(vol, i, pixels) {
     if (state.vol !== vol) return;
     const bytes = new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength);
     views.forEach((v) => v.addFrame(vol, i, bytes));
     vol.loaded = i + 1;
-    if (!state.playing) state.pos[2] = i;  // the time plane follows the newest frame
-    syncAxis(2);
-    requestDraw();
+    // With the sheet square to time, follow the newest frame so the clip plays while it loads.
+    if (!state.playing && sheet && sheet.kind === 'xy') state.depth = (sheet.D - worldCoord(vol, 2, i) * sheet.N[2]) / (2 * sheet.D);
+    update();
   }
   function finishVolume(vol, note = '') {
     if (state.vol !== vol) return;
     setProgress(null);
-    state.pos[2] = 0;
-    syncAxis(2);
+    state.depth = 0;
     setStatus(`${vol.name} · ${vol.T} frames from ${formatSeconds(vol.duration)}${note}`);
-    requestDraw();
+    update();
   }
 
   async function loadDemo() {
@@ -1181,18 +1243,19 @@ void main() {
     else loadDemo();
   });
 
-  ui.sliders.forEach((input, k) => {
-    input.addEventListener('pointerdown', () => setActive(k));
-    input.addEventListener('focus', () => { if (state.active !== k) setActive(k); });
-    input.addEventListener('input', () => {
-      if (state.active !== k) setActive(k);
-      setPos(k, Number(input.value));
-      syncAxis(k);  // snaps back if the frame isn't sampled yet
+  ui.presets.forEach((button) => button.addEventListener('click', () => reshape(PRESETS[button.dataset.preset])));
+  ui.depth.addEventListener('input', () => setDepth(Number(ui.depth.value)));
+  const params = [['omega', ui.angles.omega, -180, 180], ['phi', ui.angles.phi, -180, 180], ['kappa', ui.angles.kappa, -180, 180], ['sphere', ui.sphere, 0, 1]];
+  for (const [key, [range, number], lo, hi] of params) {
+    range.addEventListener('input', () => reshape({ [key]: Number(range.value) }));
+    number.addEventListener('input', () => {  // typed values apply as you type
+      const v = parseFloat(number.value);
+      if (Number.isFinite(v)) reshape({ [key]: clamp(v, lo, hi) });
     });
-  });
-  ui.tabs.forEach((tab) => tab.addEventListener('click', () => setActive(Number(tab.dataset.axis))));
-  ui.modeCut.addEventListener('click', () => setMode('cut'));
+    number.addEventListener('change', () => { number.value = String(state[key]); });
+  }
   ui.modeGhost.addEventListener('click', () => setMode('ghost'));
+  ui.modeCut.addEventListener('click', () => setMode('cut'));
   ui.size.addEventListener('input', () => {
     state.pointScale = Number(ui.size.value);
     syncFill(ui.size);
@@ -1211,12 +1274,11 @@ void main() {
     if (e.key === ' ' && tag !== 'BUTTON') {
       e.preventDefault();
       setPlaying(!state.playing);
-    } else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+    } else if ((e.key === 'ArrowRight' || e.key === 'ArrowLeft') && sheet) {
       e.preventDefault();
-      const step = (e.key === 'ArrowRight' ? 1 : -1) * (e.shiftKey ? 10 : 1);
-      setPos(state.active, state.pos[state.active] + step);
+      setDepth(state.depth + (e.key === 'ArrowRight' ? 1 : -1) * (e.shiftKey ? 10 : 1) * sheet.depthStep);
     } else if (e.key === '1' || e.key === '2' || e.key === '3') {
-      setActive([2, 1, 0][Number(e.key) - 1]);
+      reshape(PRESETS[['xy', 'xz', 'zy'][Number(e.key) - 1]]);
     }
   });
 
@@ -1253,10 +1315,10 @@ void main() {
 
   // Phones sample and draw faster at the lighter setting; it can still be raised from the Detail menu.
   if (matchMedia('(pointer: coarse)').matches) ui.quality.value = 'fast';
-  setActive(2);
-  setMode('cut');
+  setMode('ghost');
   setPlaying(false);
   syncFill(ui.size);
+  update();
   requestAnimationFrame(loop);
   loadDemo();
 })();
