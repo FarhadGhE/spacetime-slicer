@@ -513,7 +513,9 @@ void main() {
       const aspect = this.width / this.height;
       const radius = Math.hypot(half[0] + 0.14, half[1] + 0.14, half[2] + 0.14);
       const fit = aspect >= 1 ? fov : 2 * Math.atan(Math.tan(fov / 2) * aspect);
-      const dist = (radius / Math.sin(fit / 2)) * 0.9 * this.cam.zoom;
+      // the bounding sphere is generous, so tall narrow views (portrait clips on phones) move in a little closer
+      const snug = 0.9 - 0.18 * clamp((0.8 - aspect) / 0.4, 0, 1);
+      const dist = (radius / Math.sin(fit / 2)) * snug * this.cam.zoom;
       const { yaw, pitch } = this.cam;
       const eye = [dist * Math.cos(pitch) * Math.sin(yaw), dist * Math.sin(pitch), dist * Math.cos(pitch) * Math.cos(yaw)];
       const mvp = multiply(perspective(fov, aspect, dist * 0.02, dist * 4), lookAt(eye, [0, 0, 0], [0, 1, 0]));
@@ -604,7 +606,7 @@ void main() {
     }
     listen() {
       const c = this.canvas, pointers = new Map();
-      let drag = null;
+      let drag = null, lastTap = null;
       const local = (e) => {
         const r = c.getBoundingClientRect();
         return [e.clientX - r.left, e.clientY - r.top];
@@ -619,6 +621,11 @@ void main() {
           return;
         }
         const p = local(e);
+        if (e.pointerType !== 'mouse') {  // double-tap resets the view, as double-click does
+          const again = lastTap && e.timeStamp - lastTap.at < 300 && Math.hypot(p[0] - lastTap.p[0], p[1] - lastTap.p[1]) < 30;
+          lastTap = again ? null : { at: e.timeStamp, p };
+          if (again) this.resetView();
+        }
         if (this.nearHandle(p, e.pointerType === 'mouse' ? 18 : 32)) {  // fingers need a bigger target
           drag = { type: 'handle' };
           this.grabbed = true;
@@ -695,7 +702,8 @@ void main() {
         this.labelU.hidden = this.labelV.hidden = true;
         return;
       }
-      const W = this.cssWidth, H = this.cssHeight, pad = 38;
+      const W = this.cssWidth, H = this.cssHeight;
+      const pad = clamp(Math.min(W, H) * 0.09, 10, 38);  // small views spend their margin on the image, not on labels
       const ew = 2 * sh.extent[0], eh = 2 * sh.extent[1];
       const s = Math.max(0, Math.min((W - 2 * pad) / ew, (H - 2 * pad) / eh));
       const box = (this.box = { w: ew * s, h: eh * s });
@@ -714,13 +722,14 @@ void main() {
       gl.drawArrays(gl.POINTS, 0, sh.grid[0] * sh.grid[1]);
       gl.bindVertexArray(null);
 
-      this.placeLabel(this.labelU, sh.U, false, box.x + box.w / 2, box.y + box.h + 26, '');
-      this.placeLabel(this.labelV, sh.V, true, box.x - 26, box.y + box.h / 2, ' rotate(-90deg)');
+      const roomy = pad >= 30;
+      this.placeLabel(this.labelU, sh.U, false, box.x + box.w / 2, box.y + box.h + 26, '', roomy);
+      this.placeLabel(this.labelV, sh.V, true, box.x - 26, box.y + box.h / 2, ' rotate(-90deg)', roomy);
     }
-    // Name the block axis a sheet direction runs along, when it runs close to one.
-    placeLabel(el, w, down, x, y, turn) {
+    // Name the block axis a sheet direction runs along, when it runs close to one and there is room.
+    placeLabel(el, w, down, x, y, turn, roomy) {
       const k = dominant(w);
-      el.hidden = Math.abs(w[k]) < 0.9;
+      el.hidden = !roomy || Math.abs(w[k]) < 0.9;
       if (el.hidden) return;
       const grows = w[k] * (k === 0 ? 1 : -1) > 0;  // the voxel index grows along w
       el.textContent = grows !== down ? `${AXIS_NAMES[k]} →` : `← ${AXIS_NAMES[k]}`;
@@ -777,7 +786,8 @@ void main() {
     size: $('#size'),
     reset: $('#reset'),
     sheetName: $('#sheet-name'),
-    play: $('#play'),
+    stage: $('.stage'),
+    plays: [...document.querySelectorAll('.play')],  // the transport's, and the one beside depth on phones
     speeds: [...document.querySelectorAll('[data-speed]')],
     readout: $('#readout'),
     explain: $('#explain'),
@@ -879,8 +889,10 @@ void main() {
   let playClock = 0;
   function setPlaying(on) {
     state.playing = Boolean(on && state.vol);
-    ui.play.innerHTML = state.playing ? ICON_PAUSE : ICON_PLAY;
-    ui.play.setAttribute('aria-label', state.playing ? 'Pause' : 'Play');
+    for (const button of ui.plays) {
+      button.innerHTML = state.playing ? ICON_PAUSE : ICON_PLAY;
+      button.setAttribute('aria-label', state.playing ? 'Pause' : 'Play');
+    }
     playClock = performance.now();
   }
   function advancePlay(now) {
@@ -898,6 +910,7 @@ void main() {
     state.vol = vol;
     views.forEach((v) => v.setVolume(vol));
     state.depth = 0;
+    ui.stage.dataset.shape = vol.H > vol.W ? 'tall' : 'wide';  // on phones, portrait clips sit their two views side by side
     const points = vol.grid[0] * vol.grid[1] * vol.grid[2];
     ui.meta.textContent = `${vol.W} × ${vol.H} px · ${vol.T} frames · ${points.toLocaleString('en-US')} points`;
     update();
@@ -1264,7 +1277,7 @@ void main() {
     requestDraw();
   });
   ui.reset.addEventListener('click', () => cube.resetView());
-  ui.play.addEventListener('click', () => setPlaying(!state.playing));
+  ui.plays.forEach((button) => button.addEventListener('click', () => setPlaying(!state.playing)));
   ui.speeds.forEach((button) => button.addEventListener('click', () => {
     state.speed = Number(button.dataset.speed);
     ui.speeds.forEach((b) => b.setAttribute('aria-pressed', String(b === button)));
